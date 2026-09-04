@@ -98,6 +98,22 @@ pub(crate) fn sanitize_xai_responses_request(body: &mut Value) -> bool {
     // 6. Whitelist the tool types and clean a now-dangling `tool_choice`.
     changed |= filter_unsupported_tools(body);
 
+    // 7. Coerce each surviving `function` tool's `parameters` root schema to an
+    //    object type. xAI's strict serde parser rejects tool parameter schemas
+    //    whose root is an `anyOf`/`oneOf` union containing a non-object branch
+    //    (`[invalid_client_tool_schema] ... root schema is an anyOf/oneOf union
+    //    with a non-object branch`), and also rejects a root `type` that is not
+    //    `object`. Codex/MCP tools frequently declare `parameters` as a union
+    //    (e.g. `{"anyOf":[{"type":"object",...},{"type":"null"}]}`) or omit the
+    //    root `type`, so lift those into a single object schema.
+    let coerced = coerce_tool_parameters_to_object(body);
+    if coerced {
+        log::debug!(
+            "[Codex] Coerced non-object tool parameter root schemas to object for xAI"
+        );
+    }
+    changed |= coerced;
+
     changed
 }
 
@@ -344,6 +360,209 @@ fn should_drop_tool_choice(body: &Value, tools: &[Value]) -> bool {
     false
 }
 
+/// Coerce every surviving `function` tool's `parameters` root schema to an
+/// object type so xAI's strict tool-schema parser accepts it.
+///
+/// xAI rejects (`[invalid_client_tool_schema]`) any tool whose `parameters`
+/// root is not `{"type":"object",...}` — in particular a root `anyOf`/`oneOf`
+/// union that contains a non-object branch (e.g. the common
+/// `{"anyOf":[{"type":"object",...},{"type":"null"}]}` shape MCP/Codex tools
+/// emit to mark the argument optional). This lifts such unions into a single
+/// object schema by merging the `properties`/`required` of every object branch,
+/// falling back to a permissive object when no object branch exists. A missing
+/// or non-object `parameters` is replaced with a permissive object schema.
+///
+/// Handles both the flat Responses format (`{"type":"function","parameters":…}`)
+/// and the nested Chat format (`{"type":"function","function":{"parameters":…}}`).
+/// Also recursively coerces tool declarations embedded in `input` items (e.g.
+/// `tool_search_output` carriers), since xAI validates those too. Deterministic
+/// and idempotent.
+fn coerce_tool_parameters_to_object(body: &mut Value) -> bool {
+    let mut changed = false;
+
+    // Top-level `tools` array.
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            changed |= coerce_tool_entry_parameters(tool);
+        }
+    }
+
+    // Tool declarations embedded in `input` items (e.g. `tool_search_output`
+    // carries a `tools` array with namespace/function children). xAI's strict
+    // parser validates these alongside the top-level declarations.
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        for item in input.iter_mut() {
+            changed |= coerce_input_item_tools(item);
+        }
+    }
+
+    changed
+}
+
+/// Coerce parameters on a single tool entry, handling both flat and nested
+/// (`function` wrapper) formats.
+fn coerce_tool_entry_parameters(tool: &mut Value) -> bool {
+    let tool_type = tool
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if tool_type != "function" && tool_type != "custom" {
+        // Also recurse into carrier types (`namespace`, `mcp`,
+        // `tool_search_output`, …) that may embed function children.
+        return coerce_nested_tool_children(tool);
+    }
+
+    let mut changed = false;
+    // Flat format: parameters at top level.
+    if let Some(obj) = tool.as_object_mut() {
+        if let Some(params) = obj.get_mut("parameters") {
+            changed |= coerce_parameter_root_to_object(params);
+        }
+    }
+    // Nested format: parameters inside a `function` wrapper.
+    if let Some(func) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        if let Some(params) = func.get_mut("parameters") {
+            changed |= coerce_parameter_root_to_object(params);
+        }
+    }
+    changed
+}
+
+/// Recurse into any `tools`/`children` sub-array of a carrier tool and coerce
+/// the function children's parameters.
+fn coerce_nested_tool_children(carrier: &mut Value) -> bool {
+    let key = if carrier.get("tools").is_some() {
+        "tools"
+    } else if carrier.get("children").is_some() {
+        "children"
+    } else {
+        return false;
+    };
+    let Some(children) = carrier.get_mut(key).and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for child in children.iter_mut() {
+        changed |= coerce_tool_entry_parameters(child);
+    }
+    changed
+}
+
+/// Coerce tool declarations inside an `input` item (e.g. `tool_search_output`).
+fn coerce_input_item_tools(item: &mut Value) -> bool {
+    // An input item may carry a `tools` array directly (tool_search_output).
+    if let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut) {
+        let mut changed = false;
+        for tool in tools.iter_mut() {
+            changed |= coerce_tool_entry_parameters(tool);
+        }
+        if changed {
+            return true;
+        }
+    }
+    // Or it may be a carrier with nested children.
+    coerce_nested_tool_children(item)
+}
+
+/// Normalize a single tool `parameters` schema so its root is an object type.
+fn coerce_parameter_root_to_object(params: &mut Value) -> bool {
+    // Check for a union at the root FIRST — even if `type: "object"` is also
+    // present, xAI's strict parser treats the root as a union and rejects it
+    // when any branch is non-object.
+    let union_key = ["anyOf", "oneOf", "allOf"]
+        .into_iter()
+        .find(|k| params.get(*k).is_some());
+    if let Some(key) = union_key {
+        let mut merged_props: serde_json::Map<String, Value> = serde_json::Map::new();
+        let mut merged_required: Vec<String> = Vec::new();
+        let mut seen_required: HashSet<String> = HashSet::new();
+        if let Some(branches) = params.get(key).and_then(Value::as_array) {
+            for branch in branches {
+                if branch.get("type").and_then(Value::as_str) != Some("object") {
+                    continue;
+                }
+                if let Some(props) = branch.get("properties").and_then(Value::as_object) {
+                    for (k, v) in props {
+                        merged_props.insert(k.clone(), v.clone());
+                    }
+                }
+                if let Some(req) = branch.get("required").and_then(Value::as_array) {
+                    for r in req.iter() {
+                        if let Some(s) = r.as_str() {
+                            if seen_required.insert(s.to_string()) {
+                                merged_required.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut new_schema = serde_json::Map::new();
+        new_schema.insert("type".to_string(), Value::String("object".to_string()));
+        if let Some(desc) = params.get("description") {
+            new_schema.insert("description".to_string(), desc.clone());
+        }
+        if !merged_props.is_empty() {
+            new_schema.insert(
+                "properties".to_string(),
+                Value::Object(merged_props),
+            );
+        }
+        if !merged_required.is_empty() {
+            new_schema.insert(
+                "required".to_string(),
+                Value::Array(
+                    merged_required
+                        .into_iter()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        new_schema.insert(
+            "additionalProperties".to_string(),
+            Value::Bool(true),
+        );
+        *params = Value::Object(new_schema);
+        return true;
+    }
+
+    // Already a proper object schema with no union — nothing to do.
+    if params.get("type").and_then(Value::as_str) == Some("object") {
+        return false;
+    }
+
+    // Object literal missing a `type`, or typed as something other than object:
+    // coerce the root to object while preserving any declared `properties`.
+    if let Some(obj) = params.as_object_mut() {
+        let prev_type = obj.get("type").and_then(Value::as_str).map(str::to_string);
+        obj.insert(
+            "type".to_string(),
+            Value::String("object".to_string()),
+        );
+        // Keep `properties`/`required` if present; otherwise leave them absent
+        // (a parameterless object is valid). Ensure permissiveness when we
+        // displaced a non-object type.
+        if prev_type.is_some() && prev_type.as_deref() != Some("object") {
+            obj.entry("additionalProperties")
+                .or_insert(Value::Bool(true));
+        }
+        return true;
+    }
+
+    // Missing/null/non-object `parameters`: substitute a permissive object.
+    *params = Value::Object(serde_json::Map::from_iter([
+        ("type".to_string(), Value::String("object".to_string())),
+        ("properties".to_string(), Value::Object(serde_json::Map::new())),
+        (
+            "additionalProperties".to_string(),
+            Value::Bool(true),
+        ),
+    ]));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,5 +754,227 @@ mod tests {
         assert!(sanitize_xai_responses_request(&mut body));
         // second pass finds nothing left to change
         assert!(!sanitize_xai_responses_request(&mut body));
+    }
+
+    #[test]
+    fn coerces_anyof_union_parameter_root_to_object() {
+        // The exact shape that triggers xAI's
+        // `[invalid_client_tool_schema] ... root schema is an anyOf/oneOf union
+        // with a non-object branch`: an optional object argument expressed as
+        // `anyOf:[object, null]`.
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "mcp__codex_app__automation_update",
+                "parameters": {
+                    "anyOf": [
+                        {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+                        {"type": "null"}
+                    ]
+                }
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["tools"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["x"]["type"], "string");
+        assert_eq!(params["required"], json!(["x"]));
+        assert_eq!(params["additionalProperties"], true);
+        assert!(params.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn coerces_oneof_union_merging_multiple_object_branches() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "t",
+                "parameters": {
+                    "oneOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]},
+                        {"type": "object", "properties": {"b": {"type": "number"}}, "required": ["b"]},
+                        {"type": "string"}
+                    ]
+                }
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let props = &body["tools"][0]["parameters"]["properties"];
+        assert!(props.get("a").is_some());
+        assert!(props.get("b").is_some());
+        let required: Vec<&str> = body["tools"][0]["parameters"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"a"));
+        assert!(required.contains(&"b"));
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn coerces_union_with_no_object_branch_to_permissive_object() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "t",
+                "parameters": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["tools"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["additionalProperties"], true);
+        assert!(params.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn coerces_non_object_typed_parameters_to_object() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "t",
+                "parameters": {"type": "string"}
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["tools"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["additionalProperties"], true);
+    }
+
+    #[test]
+    fn coerces_null_parameters_to_permissive_object() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "t",
+                "parameters": null
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["tools"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["additionalProperties"], true);
+    }
+
+    #[test]
+    fn leaves_absent_parameters_untouched() {
+        // A function tool with no `parameters` field must not gain one — keeps
+        // the sanitizer a noop on clean, parameterless tool declarations.
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{"type": "function", "name": "f"}]
+        });
+        assert!(!sanitize_xai_responses_request(&mut body));
+        assert!(body["tools"][0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn leaves_already_object_parameters_untouched() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "f",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}
+            }]
+        });
+        assert!(!sanitize_xai_responses_request(&mut body));
+        assert_eq!(
+            body["tools"][0]["parameters"]["properties"]["x"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn parameter_coercion_is_idempotent() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "t",
+                "parameters": {"anyOf": [{"type": "object", "properties": {"x": {"type": "string"}}}, {"type": "null"}]}
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        assert!(!sanitize_xai_responses_request(&mut body));
+    }
+
+    #[test]
+    fn coerces_union_parameters_even_with_type_object_present() {
+        // Some schemas emit both `type: object` AND `anyOf` at the root.
+        // xAI still sees the union and rejects it, so we must coerce.
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "name": "t",
+                "parameters": {
+                    "type": "object",
+                    "anyOf": [
+                        {"type": "object", "properties": {"x": {"type": "string"}}},
+                        {"type": "null"}
+                    ]
+                }
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["tools"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert!(params.get("anyOf").is_none());
+        assert_eq!(params["properties"]["x"]["type"], "string");
+    }
+
+    #[test]
+    fn coerces_nested_function_wrapper_parameters() {
+        // Chat-style nested format: parameters inside `function`.
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "t",
+                    "parameters": {"anyOf": [{"type": "object", "properties": {"x": {"type": "string"}}}, {"type": "null"}]}
+                }
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["tools"][0]["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert!(params.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn coerces_tools_nested_in_input_tool_search_output() {
+        // Tool declarations inside `input` items (tool_search_output) are also
+        // validated by xAI's strict parser.
+        let mut body = json!({
+            "model": "grok-4.5",
+            "tools": [{"type": "function", "name": "top", "parameters": {"type": "object"}}],
+            "input": [{
+                "type": "tool_search_output",
+                "call_id": "c1",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__codex_app__",
+                    "tools": [{
+                        "type": "function",
+                        "name": "automation_update",
+                        "parameters": {"anyOf": [{"type": "object", "properties": {"x": {"type": "string"}}}, {"type": "null"}]}
+                    }]
+                }]
+            }]
+        });
+        assert!(sanitize_xai_responses_request(&mut body));
+        let params = &body["input"][0]["tools"][0]["tools"][0]["parameters"];
+        assert_eq!(params["type"], "object");
+        assert!(params.get("anyOf").is_none());
     }
 }

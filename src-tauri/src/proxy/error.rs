@@ -180,6 +180,20 @@ impl IntoResponse for ProxyError {
     }
 }
 
+pub(crate) fn error_chain_message(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !message.contains(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    message
+}
+
 /// 错误分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {

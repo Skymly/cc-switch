@@ -337,6 +337,222 @@ pub async fn process_response(
     }
 }
 
+const RESPONSES_STREAM_MAX_RETRIES: u32 = 5;
+const MAX_RESPONSES_PRIME_BYTES: usize = 256 * 1024;
+
+enum ResponsesPrimeAttempt {
+    Ready(ProxyResponse),
+    Retryable(ProxyError),
+}
+
+pub(crate) async fn prime_responses_stream_with_retry<F, Fut>(
+    response: ProxyResponse,
+    reconnect: F,
+    first_event_timeout: Duration,
+) -> Result<ProxyResponse, ProxyError>
+where
+    F: Fn() -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<ProxyResponse, ProxyError>> + Send,
+{
+    let mut attempt = Ok(response);
+
+    for retry_count in 0..=RESPONSES_STREAM_MAX_RETRIES {
+        let interruption = match attempt {
+            Ok(response) if !response.status().is_success() => ProxyError::UpstreamError {
+                status: response.status().as_u16(),
+                body: None,
+            },
+            Ok(response) if !response.is_sse() => return Ok(response),
+            Ok(response) => {
+                match prime_responses_stream_attempt(response, first_event_timeout).await {
+                    ResponsesPrimeAttempt::Ready(response) => return Ok(response),
+                    ResponsesPrimeAttempt::Retryable(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+
+        if retry_count == RESPONSES_STREAM_MAX_RETRIES {
+            return Err(ProxyError::ForwardFailed(format!(
+                "xAI Responses stream failed after {retry_count} reconnect attempt(s): {interruption}"
+            )));
+        }
+
+        let next_retry = retry_count + 1;
+        log::warn!(
+            "[Codex] xAI Responses stream interrupted before productive output; reconnecting ({next_retry}/{RESPONSES_STREAM_MAX_RETRIES}): {interruption}"
+        );
+        tokio::time::sleep(responses_stream_retry_delay(next_retry)).await;
+
+        let reconnect_future = reconnect();
+        attempt = if first_event_timeout.is_zero() {
+            reconnect_future.await
+        } else {
+            tokio::time::timeout(first_event_timeout, reconnect_future)
+                .await
+                .map_err(|_| {
+                    ProxyError::Timeout(format!(
+                        "xAI Responses stream reconnect timed out after {}s",
+                        first_event_timeout.as_secs()
+                    ))
+                })?
+        };
+    }
+
+    unreachable!()
+}
+
+async fn prime_responses_stream_attempt(
+    response: ProxyResponse,
+    first_event_timeout: Duration,
+) -> ResponsesPrimeAttempt {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut stream = Box::pin(response.bytes_stream());
+    let mut replay_chunks = Vec::new();
+    let mut parse_buffer = String::new();
+    let mut utf8_remainder = Vec::new();
+    let mut buffered_bytes = 0usize;
+
+    loop {
+        let next = if first_event_timeout.is_zero() {
+            stream.next().await
+        } else {
+            match tokio::time::timeout(first_event_timeout, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    return ResponsesPrimeAttempt::Retryable(ProxyError::Timeout(format!(
+                        "xAI Responses stream produced no productive event within {}s",
+                        first_event_timeout.as_secs()
+                    )));
+                }
+            }
+        };
+
+        let Some(chunk) = next else {
+            if inspect_complete_responses_json(&parse_buffer)
+                || (!parse_buffer.trim().is_empty()
+                    && inspect_responses_commit_event(parse_buffer.trim()))
+            {
+                return ResponsesPrimeAttempt::Ready(replay_response(
+                    status,
+                    headers,
+                    replay_chunks,
+                    stream,
+                ));
+            }
+            return ResponsesPrimeAttempt::Retryable(ProxyError::ForwardFailed(
+                "xAI Responses stream ended before productive output or a terminal event"
+                    .to_string(),
+            ));
+        };
+
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let chain = super::error::error_chain_message(&error);
+                return ResponsesPrimeAttempt::Retryable(ProxyError::ForwardFailed(format!(
+                    "xAI Responses stream transport error: {chain}"
+                )));
+            }
+        };
+
+        buffered_bytes = buffered_bytes.saturating_add(chunk.len());
+        crate::proxy::sse::append_utf8_safe(&mut parse_buffer, &mut utf8_remainder, &chunk);
+        replay_chunks.push(chunk);
+
+        if inspect_complete_responses_json(&parse_buffer) {
+            return ResponsesPrimeAttempt::Ready(replay_response(
+                status,
+                headers,
+                replay_chunks,
+                stream,
+            ));
+        }
+
+        while let Some(block) = take_sse_block(&mut parse_buffer) {
+            if inspect_responses_commit_event(&block) {
+                return ResponsesPrimeAttempt::Ready(replay_response(
+                    status,
+                    headers,
+                    replay_chunks,
+                    stream,
+                ));
+            }
+        }
+
+        if buffered_bytes >= MAX_RESPONSES_PRIME_BYTES {
+            return ResponsesPrimeAttempt::Ready(replay_response(
+                status,
+                headers,
+                replay_chunks,
+                stream,
+            ));
+        }
+    }
+}
+
+fn replay_response<S>(
+    status: http::StatusCode,
+    headers: HeaderMap,
+    replay_chunks: Vec<Bytes>,
+    stream: S,
+) -> ProxyResponse
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let replay = futures::stream::iter(replay_chunks.into_iter().map(Ok)).chain(stream);
+    ProxyResponse::streamed(status, headers, replay)
+}
+
+fn inspect_complete_responses_json(buffer: &str) -> bool {
+    let trimmed = buffer.trim();
+    matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'['))
+        && serde_json::from_str::<Value>(trimmed).is_ok()
+}
+
+fn inspect_responses_commit_event(block: &str) -> bool {
+    let mut named_event = None;
+    let mut data_lines = Vec::new();
+    for line in block.lines() {
+        if let Some(event) = strip_sse_field(line, "event") {
+            named_event = Some(event.trim().to_string());
+        } else if let Some(data) = strip_sse_field(line, "data") {
+            data_lines.push(data);
+        }
+    }
+    if data_lines.is_empty() {
+        return false;
+    }
+    let data = data_lines.join("\n");
+    if data.trim() == "[DONE]" {
+        return true;
+    }
+    let value: Value = match serde_json::from_str(&data) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    let event = named_event
+        .as_deref()
+        .filter(|event| !event.is_empty())
+        .or_else(|| value.get("type").and_then(Value::as_str))
+        .unwrap_or("");
+
+    !matches!(
+        event,
+        "" | "response.created"
+            | "response.in_progress"
+            | "response.queued"
+            | "response.output_item.added"
+            | "response.content_part.added"
+            | "response.reasoning_summary_part.added"
+    )
+}
+
+fn responses_stream_retry_delay(retry: u32) -> Duration {
+    Duration::from_millis(200u64 << retry.saturating_sub(1).min(4))
+}
+
 // ============================================================================
 // SSE 使用量收集器
 // ============================================================================
@@ -887,6 +1103,215 @@ mod tests {
         assert!(formatted.contains("cf-ray=abc123-SJC"), "{formatted}");
         assert!(!formatted.contains("super-secret"), "{formatted}");
         assert!(!formatted.contains("cookie-secret"), "{formatted}");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_retries_transport_drop_before_productive_event() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let lifecycle = Bytes::from(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"first\"}}\n\n\
+             event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\"}}\n\n",
+        );
+        let initial = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            headers.clone(),
+            futures::stream::iter(vec![
+                Ok(lifecycle),
+                Err(std::io::Error::other("error decoding response body")),
+            ]),
+        );
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconnect_count = reconnects.clone();
+        let reconnect = move || {
+            reconnect_count.fetch_add(1, Ordering::SeqCst);
+            let headers = headers.clone();
+            async move {
+                Ok(ProxyResponse::streamed(
+                    http::StatusCode::OK,
+                    headers,
+                    futures::stream::once(async {
+                        Ok(Bytes::from(
+                            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"second\"}}\n\n\
+                             event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
+                             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"second\",\"status\":\"completed\"}}\n\n",
+                        ))
+                    }),
+                ))
+            }
+        };
+
+        let response =
+            prime_responses_stream_with_retry(initial, reconnect, Duration::from_secs(1))
+                .await
+                .unwrap();
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+        assert!(!output.contains("\"id\":\"first\""), "{output}");
+        assert!(output.contains("\"id\":\"second\""), "{output}");
+        assert!(output.contains("response.completed"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_retries_clean_eof_before_productive_event() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let initial = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            headers.clone(),
+            futures::stream::once(async {
+                Ok(Bytes::from(
+                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"first\"}}\n\n",
+                ))
+            }),
+        );
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconnect_count = reconnects.clone();
+        let reconnect = move || {
+            reconnect_count.fetch_add(1, Ordering::SeqCst);
+            let headers = headers.clone();
+            async move {
+                Ok(ProxyResponse::streamed(
+                    http::StatusCode::OK,
+                    headers,
+                    futures::stream::once(async {
+                        Ok(Bytes::from(
+                            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"second\"}}\n\n\
+                             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"second\",\"status\":\"completed\"}}\n\n",
+                        ))
+                    }),
+                ))
+            }
+        };
+
+        let response =
+            prime_responses_stream_with_retry(initial, reconnect, Duration::from_secs(1))
+                .await
+                .unwrap();
+        let mut stream = Box::pin(response.bytes_stream());
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        let output = String::from_utf8(output).unwrap();
+
+        assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+        assert!(!output.contains("\"id\":\"first\""), "{output}");
+        assert!(output.contains("\"id\":\"second\""), "{output}");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_does_not_retry_after_productive_output() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let initial = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            headers.clone(),
+            futures::stream::iter(vec![
+                Ok(Bytes::from(
+                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"first\"}}\n\n\
+                     event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                )),
+                Err(std::io::Error::other("connection reset")),
+            ]),
+        );
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconnect_count = reconnects.clone();
+        let reconnect = move || {
+            reconnect_count.fetch_add(1, Ordering::SeqCst);
+            let headers = headers.clone();
+            async move {
+                Ok(ProxyResponse::streamed(
+                    http::StatusCode::OK,
+                    headers,
+                    futures::stream::empty(),
+                ))
+            }
+        };
+
+        let response =
+            prime_responses_stream_with_retry(initial, reconnect, Duration::from_secs(1))
+                .await
+                .unwrap();
+        let mut stream = Box::pin(response.bytes_stream());
+        let first = stream.next().await.unwrap().unwrap();
+        let error = stream.next().await.unwrap().unwrap_err();
+
+        assert_eq!(reconnects.load(Ordering::SeqCst), 0);
+        assert!(String::from_utf8_lossy(&first).contains("partial"));
+        assert!(error.to_string().contains("connection reset"));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_passes_semantic_failure_without_retry() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let initial = ProxyResponse::streamed(
+            http::StatusCode::OK,
+            headers,
+            futures::stream::once(async {
+                Ok(Bytes::from(
+                    "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"message\":\"upstream failed\"}}}\n\n",
+                ))
+            }),
+        );
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconnect_count = reconnects.clone();
+        let reconnect = move || {
+            reconnect_count.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err(ProxyError::ForwardFailed(
+                    "unexpected reconnect".to_string(),
+                ))
+            }
+        };
+
+        let response =
+            prime_responses_stream_with_retry(initial, reconnect, Duration::from_secs(1))
+                .await
+                .unwrap();
+        let mut stream = Box::pin(response.bytes_stream());
+        let output = stream.next().await.unwrap().unwrap();
+
+        assert_eq!(reconnects.load(Ordering::SeqCst), 0);
+        assert!(String::from_utf8_lossy(&output).contains("upstream failed"));
+    }
+
+    #[test]
+    fn error_chain_message_preserves_nested_transport_cause() {
+        #[derive(Debug)]
+        struct TransportError;
+
+        impl std::fmt::Display for TransportError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("connection reset by peer")
+            }
+        }
+
+        impl std::error::Error for TransportError {}
+
+        let error = std::io::Error::other(TransportError);
+        let message = super::super::error::error_chain_message(&error);
+
+        assert!(message.contains("connection reset by peer"), "{message}");
     }
 
     #[tokio::test]

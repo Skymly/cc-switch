@@ -2253,6 +2253,50 @@ impl RequestForwarder {
             resolved_claude_api_format.as_deref(),
             is_copilot,
         );
+        let streaming_header_timeout = if self.streaming_first_byte_timeout.is_zero() {
+            timeout
+        } else {
+            self.streaming_first_byte_timeout
+        };
+        let xai_stream_reconnect = if request_is_streaming
+            && matches!(app_type, AppType::Codex)
+            && provider.is_xai_oauth()
+            && endpoint.split('?').next() == Some("/responses")
+            && (is_socks_proxy || !preserve_exact_header_case)
+        {
+            let retry_url = url.clone();
+            let retry_method = method.clone();
+            let retry_headers = ordered_headers.clone();
+            let retry_body = Bytes::copy_from_slice(&body_bytes);
+            Some(move || {
+                let url = retry_url.clone();
+                let method = retry_method.clone();
+                let headers = retry_headers.clone();
+                let body = retry_body.clone();
+                async move {
+                    let client = super::http_client::get();
+                    let mut request = client
+                        .request(method, &url)
+                        .timeout(std::time::Duration::from_secs(24 * 60 * 60));
+                    for (key, value) in &headers {
+                        request = request.header(key, value);
+                    }
+                    let send = request.body(body).send();
+                    let send_result = tokio::time::timeout(streaming_header_timeout, send)
+                        .await
+                        .map_err(|_| {
+                            ProxyError::Timeout(format!(
+                                "xAI Responses stream reconnect timed out after {}s",
+                                streaming_header_timeout.as_secs()
+                            ))
+                        })?;
+                    let response = send_result.map_err(map_reqwest_send_error)?;
+                    Ok(ProxyResponse::Reqwest(response))
+                }
+            })
+        } else {
+            None
+        };
 
         // 发送请求
         let response = if is_socks_proxy || !preserve_exact_header_case {
@@ -2275,17 +2319,12 @@ impl RequestForwarder {
             }
             let send = request.body(body_bytes).send();
             let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
-                } else {
-                    self.streaming_first_byte_timeout
-                };
-                tokio::time::timeout(header_timeout, send)
+                tokio::time::timeout(streaming_header_timeout, send)
                     .await
                     .map_err(|_| {
                         ProxyError::Timeout(format!(
                             "流式响应首包超时: {}s（上游未返回响应头）",
-                            header_timeout.as_secs()
+                            streaming_header_timeout.as_secs()
                         ))
                     })?
             } else {
@@ -2316,6 +2355,16 @@ impl RequestForwarder {
         let status = response.status();
 
         if status.is_success() {
+            let response = if let Some(reconnect) = xai_stream_reconnect {
+                super::response_processor::prime_responses_stream_with_retry(
+                    response,
+                    reconnect,
+                    streaming_header_timeout,
+                )
+                .await?
+            } else {
+                response
+            };
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
